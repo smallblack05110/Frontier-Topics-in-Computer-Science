@@ -1223,6 +1223,11 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
         delete[] norm_val;
     }
     diskann::cout << "done.." << std::endl;
+    // Cache file descriptor for async IO pipeline (no per-query cast needed)
+#ifndef _WINDOWS
+    { LinuxAlignedFileReader *_lr = dynamic_cast<LinuxAlignedFileReader *>(reader.get());
+      if (_lr) _cached_fd = _lr->get_file_desc(); }
+#endif
     return 0;
 }
 
@@ -1457,6 +1462,13 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         cached_nhoods.clear();
         sector_scratch_idx = 0;
         std::vector<GorgeousEntry> gorgeous_batch;
+#ifndef _WINDOWS
+        // Async IO: per-iteration iocb storage (stack, beam_width <= 16)
+        struct iocb    _acbs[16];
+        struct iocb   *_aptrs[16];
+        struct io_event _aevts[16];
+        int _nasync = 0;
+#endif
         // find new beam
         uint32_t num_seen = 0;
         while (retset.has_unexpanded_node() && frontier.size() < beam_width && num_seen < beam_width)
@@ -1514,15 +1526,24 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             }
             io_timer.reset();
 #ifdef USE_BING_INFRA
-            reader->read(frontier_read_reqs, ctx,
-                         true); // asynhronous reader for Bing.
-#else
-            reader->read(frontier_read_reqs, ctx); // synchronous IO linux
-#endif
-            if (stats != nullptr)
-            {
-                stats->io_us += (float)io_timer.elapsed();
+            reader->read(frontier_read_reqs, ctx, true);
+#elif defined(__linux__)
+            // === ASYNC IO PIPELINE ===
+            // Submit IO now; CPU will process cache+gorgeous while disk is working
+            _nasync = (int)frontier_read_reqs.size();
+            for (int _i = 0; _i < _nasync; _i++) {
+                auto &_r = frontier_read_reqs[_i];
+                io_prep_pread(&_acbs[_i], _cached_fd, _r.buf,
+                              (long)_r.len, (long long)_r.offset);
+                _acbs[_i].data = (void *)(intptr_t)_i; // completion ID
+                _aptrs[_i] = &_acbs[_i];
             }
+            io_submit(ctx, (long)_nasync, _aptrs);
+            // io_us will be recorded after io_getevents below
+#else
+            reader->read(frontier_read_reqs, ctx);
+            if (stats != nullptr) stats->io_us += (float)io_timer.elapsed();
+#endif
         }
 
         // process cached nhoods
@@ -1622,6 +1643,29 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             assert(completedIndex >= 0);
             auto &frontier_nhood = frontier_nhoods[completedIndex];
             (*ctx.m_pRequestsStatus)[completedIndex] = IOContext::PROCESS_COMPLETE;
+#elif defined(__linux__)
+        // === ASYNC IO PIPELINE: min_nr=1, process in completion order ===
+        // Collect IO completions one-by-one; reorder frontier_nhoods accordingly
+        if (_nasync > 0) {
+            int _rem = _nasync; _nasync = 0;
+            std::vector<size_t> _comp_order;
+            _comp_order.reserve(_rem);
+            while (_rem > 0) {
+                io_getevents(ctx, 1, 1, _aevts, nullptr); // wait for exactly 1
+                _rem--;
+                if (stats != nullptr) stats->io_us += (float)io_timer.elapsed();
+                io_timer.reset();
+                _comp_order.push_back((size_t)(intptr_t)_aevts[0].data);
+            }
+            // Reorder so the loop below runs in IO completion order
+            std::vector<std::pair<uint32_t, char *>> _fnh_sorted;
+            _fnh_sorted.reserve(_comp_order.size());
+            for (size_t _ci : _comp_order)
+                _fnh_sorted.push_back(frontier_nhoods[_ci]);
+            frontier_nhoods = std::move(_fnh_sorted);
+        }
+        for (auto &frontier_nhood : frontier_nhoods)
+        {
 #else
         for (auto &frontier_nhood : frontier_nhoods)
         {

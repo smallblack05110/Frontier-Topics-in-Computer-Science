@@ -34,6 +34,7 @@ class LinuxAlignedFileReader : public AlignedFileReader
     // process batch of aligned requests in parallel
     // NOTE :: blocking call
     void read(std::vector<AlignedRead> &read_reqs, IOContext &ctx, bool async = false);
+    int get_file_desc() const { return file_desc; } // for async IO pipeline
 };
 
 #endif

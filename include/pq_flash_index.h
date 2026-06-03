@@ -220,6 +220,9 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     bool _count_visited_nodes = false;
     bool _reorder_data_exists = false;
     uint64_t _reoreder_data_offset = 0;
+    // Cached file descriptor for async IO pipeline (set once at load)
+    int _cached_fd = -1;
+
     // Gorgeous block optimization (see build_gorgeous_index.cpp)
     // k_copy > 0 means this is a gorgeous extended index
     uint32_t _gorgeous_k_copy = 0;
