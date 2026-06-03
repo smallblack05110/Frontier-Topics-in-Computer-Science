@@ -220,6 +220,11 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     bool _count_visited_nodes = false;
     bool _reorder_data_exists = false;
     uint64_t _reoreder_data_offset = 0;
+    // Gorgeous block optimization (see build_gorgeous_index.cpp)
+    // k_copy > 0 means this is a gorgeous extended index
+    uint32_t _gorgeous_k_copy = 0;
+    uint64_t _gorgeous_orig_max_node_len = 0; // original (non-extended) max_node_len
+
 
     // filter support
     uint32_t *_pts_to_label_offsets = nullptr;

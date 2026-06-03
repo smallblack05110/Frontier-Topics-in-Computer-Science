@@ -1041,6 +1041,23 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
     READ_U32(index_metadata, nr);
     READ_U32(index_metadata, nc);
 
+    // Gorgeous mode detection: peek at fields 8,9 (beyond standard 0-7 fields)
+    if (nr >= 10)
+    {
+        auto saved_pos = index_metadata.tellg();
+        // nr/nc = 8 bytes; fields 0-7 = 8*8=64 bytes; gorgeous at offset 72
+        index_metadata.seekg(8 + 8 * sizeof(uint64_t), std::ios::beg);
+        uint64_t g_k_copy = 0, g_orig_max_node_len = 0;
+        READ_U64(index_metadata, g_k_copy);
+        READ_U64(index_metadata, g_orig_max_node_len);
+        if (g_k_copy > 0 && g_orig_max_node_len > 0)
+        {
+            _gorgeous_k_copy = static_cast<uint32_t>(g_k_copy);
+            _gorgeous_orig_max_node_len = g_orig_max_node_len;
+        }
+        index_metadata.seekg(saved_pos, std::ios::beg);
+    }
+
     uint64_t disk_nnodes;
     uint64_t disk_ndims; // can be disk PQ dim if disk_PQ is set to true
     READ_U64(index_metadata, disk_nnodes);
@@ -1059,6 +1076,15 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
     READ_U64(index_metadata, _max_node_len);
     READ_U64(index_metadata, _nnodes_per_sector);
     _max_degree = ((_max_node_len - _disk_bytes_per_point) / sizeof(uint32_t)) - 1;
+
+    // Correct max_degree for gorgeous extended format
+    if (_gorgeous_orig_max_node_len > 0)
+    {
+        _max_degree = ((_gorgeous_orig_max_node_len - _disk_bytes_per_point) / sizeof(uint32_t)) - 1;
+        diskann::cout << "Gorgeous mode: k_copy=" << _gorgeous_k_copy
+                      << " orig_max_node_len=" << _gorgeous_orig_max_node_len
+                      << " corrected max_degree=" << _max_degree << std::endl;
+    }
 
     if (_max_degree > defaults::MAX_GRAPH_DEGREE)
     {
@@ -1408,6 +1434,13 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     // cleared every iteration
     std::vector<uint32_t> frontier;
     frontier.reserve(2 * beam_width);
+
+    // Per-query cache: adj lists extracted from gorgeous embedded blocks
+    tsl::robin_map<uint32_t, std::vector<uint32_t>> gorgeous_cache;
+    if (_gorgeous_k_copy > 0)
+        gorgeous_cache.reserve(512);
+    struct GorgeousEntry { uint32_t id; float pq_dist; };
+
     std::vector<std::pair<uint32_t, char *>> frontier_nhoods;
     frontier_nhoods.reserve(2 * beam_width);
     std::vector<AlignedRead> frontier_read_reqs;
@@ -1423,6 +1456,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         frontier_read_reqs.clear();
         cached_nhoods.clear();
         sector_scratch_idx = 0;
+        std::vector<GorgeousEntry> gorgeous_batch;
         // find new beam
         uint32_t num_seen = 0;
         while (retset.has_unexpanded_node() && frontier.size() < beam_width && num_seen < beam_width)
@@ -1433,6 +1467,14 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             if (iter != _nhood_cache.end())
             {
                 cached_nhoods.push_back(std::make_pair(nbr.id, iter->second));
+                if (stats != nullptr)
+                {
+                    stats->n_cache_hits++;
+                }
+            }
+            else if (_gorgeous_k_copy > 0 && gorgeous_cache.count(nbr.id))
+            {
+                gorgeous_batch.push_back(GorgeousEntry{nbr.id, nbr.distance});
                 if (stats != nullptr)
                 {
                     stats->n_cache_hits++;
@@ -1534,6 +1576,41 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 }
             }
         }
+
+        // Process gorgeous-cached nodes (adj list known; skip I/O, use PQ distance)
+        if (_gorgeous_k_copy > 0 && !gorgeous_batch.empty())
+        {
+            for (auto &ge : gorgeous_batch)
+            {
+                auto &gadj = gorgeous_cache.at(ge.id);
+                full_retset.push_back(Neighbor(ge.id, ge.pq_dist));
+                cpu_timer.reset();
+                compute_dists(gadj.data(), (uint64_t)gadj.size(), dist_scratch);
+                if (stats != nullptr)
+                {
+                    stats->n_cmps += (uint32_t)gadj.size();
+                    stats->cpu_us += (float)cpu_timer.elapsed();
+                }
+                cpu_timer.reset();
+                for (uint64_t m = 0; m < gadj.size(); ++m)
+                {
+                    uint32_t id = gadj[m];
+                    if (visited.insert(id).second)
+                    {
+                        if (!use_filter && _dummy_pts.find(id) != _dummy_pts.end())
+                            continue;
+                        if (use_filter && !(point_has_label(id, filter_label)) &&
+                            (!_use_universal_label || !point_has_label(id, _universal_filter_label)))
+                            continue;
+                        cmps++;
+                        retset.insert(Neighbor(id, dist_scratch[m]));
+                    }
+                }
+                if (stats != nullptr)
+                    stats->cpu_us += (float)cpu_timer.elapsed();
+            }
+        }
+
 #ifdef USE_BING_INFRA
         // process each frontier nhood - compute distances to unvisited nodes
         int completedIndex = -1;
@@ -1605,6 +1682,27 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             if (stats != nullptr)
             {
                 stats->cpu_us += (float)cpu_timer.elapsed();
+            }
+
+            // Extract embedded adj lists for next-hop caching (gorgeous)
+            if (_gorgeous_k_copy > 0)
+            {
+                // emb_stride = (orig_max_degree+1)*4 = orig_max_node_len - disk_bytes_per_point
+                const uint64_t emb_stride = _gorgeous_orig_max_node_len - _disk_bytes_per_point;
+                const uint32_t n_emb = std::min((uint64_t)_gorgeous_k_copy, nnbrs);
+                for (uint32_t ci = 0; ci < n_emb; ci++)
+                {
+                    uint32_t nbr_id = node_nbrs[ci];
+                    if (!gorgeous_cache.count(nbr_id) && !_nhood_cache.count(nbr_id))
+                    {
+                        const uint32_t *emb = reinterpret_cast<const uint32_t *>(
+                            node_disk_buf + _gorgeous_orig_max_node_len + ci * emb_stride);
+                        uint32_t emb_nnbrs = emb[0];
+                        if (emb_nnbrs > 0 && emb_nnbrs <= _max_degree)
+                            gorgeous_cache.emplace(nbr_id,
+                                std::vector<uint32_t>(emb + 1, emb + 1 + emb_nnbrs));
+                    }
+                }
             }
         }
 
