@@ -93,6 +93,15 @@ template <typename T, typename LabelT> PQFlashIndex<T, LabelT>::~PQFlashIndex()
     {
         delete[] _pts_to_labels;
     }
+
+    // Stop reconcile thread
+    _stop_reconcile.store(true);
+    if (_reconcile_thread.joinable())
+        _reconcile_thread.join();
+
+    // Free dynamic cache buffers
+    for (auto *p : _dyn_nhood_bufs) delete[] p;
+    for (auto *p : _dyn_coord_bufs) diskann::aligned_free(p);
 }
 
 template <typename T, typename LabelT> inline uint64_t PQFlashIndex<T, LabelT>::get_node_sector(uint64_t node_id)
@@ -251,6 +260,107 @@ template <typename T, typename LabelT> void PQFlashIndex<T, LabelT>::load_cache_
         }
     }
     diskann::cout << "..done." << std::endl;
+
+    // Initialize dynamic LFU cache layer: 15% of static cache size, min 64
+    _dyn_cache_cap = std::max<uint64_t>(64, num_cached_nodes * 15 / 100);
+    _cms.reset();
+    diskann::cout << "Dynamic cache layer: capacity=" << _dyn_cache_cap << " nodes." << std::endl;
+
+    // Start background reconcile thread
+    _stop_reconcile.store(false);
+    _reconcile_thread = std::thread([this]() {
+        // Wait for a warmed-up system before first reconcile
+        std::this_thread::sleep_for(std::chrono::seconds(20));
+        while (!_stop_reconcile.load(std::memory_order_relaxed))
+        {
+            _reconcile_dynamic_cache();
+            // Sleep 30s between reconciles; check stop flag in 1s increments
+            for (int i = 0; i < 30 && !_stop_reconcile.load(); i++)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    });
+}
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::_reconcile_dynamic_cache()
+{
+    // Find top-_dyn_cache_cap nodes by CMS estimate, excluding static cache
+    // Use a small heap to avoid sorting all _num_points entries
+    using ScoreId = std::pair<uint32_t, uint32_t>; // (score, id)
+    std::vector<ScoreId> heap; // min-heap by score
+    heap.reserve(_dyn_cache_cap + 1);
+
+    auto cmp = [](const ScoreId &a, const ScoreId &b) { return a.first > b.first; };
+
+    for (uint32_t id = 0; id < (uint32_t)_num_points; id++)
+    {
+        if (_nhood_cache.count(id)) continue; // already in static cache
+        uint32_t score = _cms.estimate(id);
+        if (score == 0) continue;
+        heap.push_back({score, id});
+        std::push_heap(heap.begin(), heap.end(), cmp);
+        if (heap.size() > _dyn_cache_cap)
+        {
+            std::pop_heap(heap.begin(), heap.end(), cmp);
+            heap.pop_back();
+        }
+    }
+
+    if (heap.empty()) return;
+
+    // Collect candidate ids
+    std::vector<uint32_t> candidates;
+    candidates.reserve(heap.size());
+    for (auto &p : heap) candidates.push_back(p.second);
+
+    // Read from disk
+    std::vector<uint32_t *> new_nhood_bufs;
+    std::vector<T *>        new_coord_bufs;
+    std::vector<std::pair<uint32_t, uint32_t *>> nbr_buffers;
+    std::vector<T *> coord_buffers;
+
+    for (size_t i = 0; i < candidates.size(); i++)
+    {
+        auto *nb = new uint32_t[_max_degree + 1];
+        T *cb = nullptr;
+        diskann::alloc_aligned((void **)&cb, _aligned_dim * sizeof(T), 8 * sizeof(T));
+        new_nhood_bufs.push_back(nb);
+        new_coord_bufs.push_back(cb);
+        nbr_buffers.emplace_back(0u, nb);
+        coord_buffers.push_back(cb);
+    }
+
+    auto read_status = read_nodes(candidates, coord_buffers, nbr_buffers);
+
+    // Swap into dynamic cache under write lock
+    {
+        std::unique_lock<std::shared_mutex> lk(_dyn_cache_mutex);
+
+        // Evict nodes whose CMS score dropped below median of new candidates (cold eviction)
+        // Simple strategy: evict all existing dynamic entries, replace with new set
+        // (dynamic layer is small, so full replacement is fine)
+        for (auto *p : _dyn_nhood_bufs) delete[] p;
+        for (auto *p : _dyn_coord_bufs) diskann::aligned_free(p);
+        _dyn_nhood_bufs.clear();
+        _dyn_coord_bufs.clear();
+        _dyn_nhood_cache.clear();
+        _dyn_coord_cache.clear();
+
+        for (size_t i = 0; i < candidates.size(); i++)
+        {
+            if (!read_status[i]) {
+                delete[] new_nhood_bufs[i];
+                diskann::aligned_free(new_coord_bufs[i]);
+                continue;
+            }
+            _dyn_nhood_bufs.push_back(new_nhood_bufs[i]);
+            _dyn_coord_bufs.push_back(new_coord_bufs[i]);
+            _dyn_nhood_cache.insert({candidates[i], nbr_buffers[i]});
+            _dyn_coord_cache.insert({candidates[i], coord_buffers[i]});
+        }
+    }
+    diskann::cout << "[DynCache] reconciled: " << _dyn_nhood_cache.size() << " nodes." << std::endl;
+    _cms.reset(); // reset sketch for next window
 }
 
 #ifdef EXEC_ENV_OLS
@@ -285,7 +395,7 @@ void PQFlashIndex<T, LabelT>::generate_cache_list_from_sample_queries(std::strin
     for (uint32_t i = 0; i < _node_visit_counter.size(); i++)
     {
         this->_node_visit_counter[i].first = i;
-        this->_node_visit_counter[i].second = 0;
+        this->_node_visit_counter[i].second = 0.0f;
     }
 
     uint64_t sample_num, sample_dim, sample_aligned_dim;
@@ -331,17 +441,97 @@ void PQFlashIndex<T, LabelT>::generate_cache_list_from_sample_queries(std::strin
     }
 
     std::sort(this->_node_visit_counter.begin(), _node_visit_counter.end(),
-              [](std::pair<uint32_t, uint32_t> &left, std::pair<uint32_t, uint32_t> &right) {
+              [](const std::pair<uint32_t, float> &left, const std::pair<uint32_t, float> &right) {
                   return left.second > right.second;
               });
     node_list.clear();
     node_list.shrink_to_fit();
     num_nodes_to_cache = std::min(num_nodes_to_cache, this->_node_visit_counter.size());
     node_list.reserve(num_nodes_to_cache);
-    for (uint64_t i = 0; i < num_nodes_to_cache; i++)
+
+    // Gorgeous-aware deduplication:
+    // If a candidate node is already embedded as a top-k neighbor inside
+    // a sector of a node that IS being cached, gorgeous will serve it for
+    // free. Skip those slots and give them to uncovered nodes instead.
+    if (_gorgeous_k_copy > 0)
     {
-        node_list.push_back(this->_node_visit_counter[i].first);
+        // First pass: collect nodes that will definitely be cached (uncovered)
+        tsl::robin_set<uint32_t> will_cache;
+        tsl::robin_set<uint32_t> gorgeous_covered;
+
+        // We need the adjacency list of each chosen node to know its gorgeous neighbors.
+        // Load them in bulk using read_nodes.
+        // Strategy: two-pass.
+        //   Pass 1: select greedily, marking gorgeous-covered nodes.
+        //   We approximate by iterating the sorted list; for each selected node,
+        //   mark its top _gorgeous_k_copy neighbors as covered.
+        //   We need nhoods -- read them on the fly in blocks of 64.
+        const size_t BLOCK = 64;
+        size_t cand_idx = 0;
+        size_t total_cands = _node_visit_counter.size();
+
+        while (node_list.size() < num_nodes_to_cache && cand_idx < total_cands)
+        {
+            // Build a block of candidates not yet covered
+            std::vector<uint32_t> block_ids;
+            block_ids.reserve(BLOCK);
+            size_t scan = cand_idx;
+            while (block_ids.size() < BLOCK && scan < total_cands)
+            {
+                uint32_t id = _node_visit_counter[scan].first;
+                if (!gorgeous_covered.count(id))
+                    block_ids.push_back(id);
+                scan++;
+            }
+            cand_idx = scan;
+            if (block_ids.empty()) break;
+
+            // Read nhoods for block
+            std::vector<T *> dummy_coords(block_ids.size(), nullptr);
+            std::vector<uint32_t> nhood_store(block_ids.size() * (_max_degree + 1), 0u);
+            std::vector<std::pair<uint32_t, uint32_t *>> nbr_bufs;
+            nbr_bufs.reserve(block_ids.size());
+            for (size_t bi = 0; bi < block_ids.size(); bi++)
+                nbr_bufs.emplace_back(0u, nhood_store.data() + bi * (_max_degree + 1));
+            auto ok = read_nodes(block_ids, dummy_coords, nbr_bufs);
+
+            for (size_t bi = 0; bi < block_ids.size(); bi++)
+            {
+                if (node_list.size() >= num_nodes_to_cache) break;
+                uint32_t id = block_ids[bi];
+                if (gorgeous_covered.count(id)) continue;
+                node_list.push_back(id);
+                will_cache.insert(id);
+                // Mark this node's top k_copy neighbors as covered by gorgeous
+                if (ok[bi])
+                {
+                    uint32_t *nh = nbr_bufs[bi].second;
+                    uint32_t nn = std::min(nh[0], (uint32_t)_gorgeous_k_copy);
+                    for (uint32_t ni = 0; ni < nn; ni++)
+                        gorgeous_covered.insert(nh[1 + ni]);
+                }
+            }
+        }
+
+        // Fill remainder without gorgeous check if we didn't reach quota
+        if (node_list.size() < num_nodes_to_cache)
+        {
+            for (size_t i = 0; i < total_cands && node_list.size() < num_nodes_to_cache; i++)
+            {
+                uint32_t id = _node_visit_counter[i].first;
+                if (!will_cache.count(id))
+                    node_list.push_back(id);
+            }
+        }
+        diskann::cout << "Gorgeous-aware dedup: selected " << node_list.size()
+                      << " nodes (covered " << gorgeous_covered.size() << " by gorgeous)." << std::endl;
     }
+    else
+    {
+        for (uint64_t i = 0; i < num_nodes_to_cache; i++)
+            node_list.push_back(this->_node_visit_counter[i].first);
+    }
+
     this->_count_visited_nodes = false;
 
     diskann::aligned_free(samples);
@@ -1480,25 +1670,50 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             {
                 cached_nhoods.push_back(std::make_pair(nbr.id, iter->second));
                 if (stats != nullptr)
-                {
                     stats->n_cache_hits++;
-                }
-            }
-            else if (_gorgeous_k_copy > 0 && gorgeous_cache.count(nbr.id))
-            {
-                gorgeous_batch.push_back(GorgeousEntry{nbr.id, nbr.distance});
-                if (stats != nullptr)
-                {
-                    stats->n_cache_hits++;
-                }
             }
             else
             {
-                frontier.push_back(nbr.id);
+                // Check dynamic LFU cache (shared_lock: concurrent reads OK)
+                bool dyn_hit = false;
+                if (_dyn_cache_cap > 0)
+                {
+                    std::shared_lock<std::shared_mutex> lk(_dyn_cache_mutex);
+                    auto dit = _dyn_nhood_cache.find(nbr.id);
+                    if (dit != _dyn_nhood_cache.end())
+                    {
+                        cached_nhoods.push_back(std::make_pair(nbr.id, dit->second));
+                        dyn_hit = true;
+                        if (stats != nullptr)
+                            stats->n_cache_hits++;
+                    }
+                }
+                if (!dyn_hit)
+                {
+                    if (_gorgeous_k_copy > 0 && gorgeous_cache.count(nbr.id))
+                    {
+                        gorgeous_batch.push_back(GorgeousEntry{nbr.id, nbr.distance});
+                        if (stats != nullptr)
+                            stats->n_cache_hits++;
+                    }
+                    else
+                    {
+                        frontier.push_back(nbr.id);
+                    }
+                }
             }
+
+            // Update CMS for dynamic cache promotion (always, cheap atomic)
+            if (_dyn_cache_cap > 0)
+                _cms.add(nbr.id);
+
+            // Weighted visit counter for cache list generation (offline only)
             if (this->_count_visited_nodes)
             {
-                reinterpret_cast<std::atomic<uint32_t> &>(this->_node_visit_counter[nbr.id].second).fetch_add(1);
+                // Weight = 1/(1+hops): nodes visited late in search score higher
+                float w = 1.0f / (1.0f + (float)hops);
+                reinterpret_cast<std::atomic<uint32_t> &>(this->_node_visit_counter[nbr.id].second)
+                    .fetch_add((uint32_t)(w * 1024.0f)); // scaled to integer for atomicity
             }
         }
 

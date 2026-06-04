@@ -15,6 +15,10 @@
 #include "scratch.h"
 #include "tsl/robin_map.h"
 #include "tsl/robin_set.h"
+#include "cms_cache.h"
+#include <shared_mutex>
+#include <thread>
+#include <atomic>
 
 #define FULL_PRECISION_REORDER_MULTIPLIER 3
 
@@ -123,6 +127,7 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     DISKANN_DLLEXPORT void generate_random_labels(std::vector<LabelT> &labels, const uint32_t num_labels,
                                                   const uint32_t nthreads);
     void reset_stream_for_reading(std::basic_istream<char> &infile);
+    void _reconcile_dynamic_cache();
 
     // sector # on disk where node_id is present with in the graph part
     DISKANN_DLLEXPORT uint64_t get_node_sector(uint64_t node_id);
@@ -173,7 +178,8 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     uint64_t _disk_bytes_per_point = 0; // Number of bytes
 
     std::string _disk_index_file;
-    std::vector<std::pair<uint32_t, uint32_t>> _node_visit_counter;
+    // weighted visit score: score += 1/(1+hop), so late-hop nodes score higher
+    std::vector<std::pair<uint32_t, float>> _node_visit_counter;
 
     // PQ data
     // _n_chunks = # of chunks ndims is split into
@@ -227,6 +233,21 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     // k_copy > 0 means this is a gorgeous extended index
     uint32_t _gorgeous_k_copy = 0;
     uint64_t _gorgeous_orig_max_node_len = 0; // original (non-extended) max_node_len
+
+    // Dynamic LFU cache layer (B optimization)
+    // Sits on top of the static _nhood_cache; holds hot nodes discovered at runtime.
+    CountMinSketch _cms;
+    uint64_t _dyn_cache_cap = 0; // max nodes in dynamic layer (set in load_cache_list)
+    // dynamic nhood cache: node_id -> (degree, ptr into _dyn_nhood_buf)
+    tsl::robin_map<uint32_t, std::pair<uint32_t, uint32_t *>> _dyn_nhood_cache;
+    tsl::robin_map<uint32_t, T *>                              _dyn_coord_cache;
+    std::vector<uint32_t *> _dyn_nhood_bufs; // owns raw buffers (each _max_degree+1 u32s)
+    std::vector<T *>        _dyn_coord_bufs; // owns raw coord buffers (each _aligned_dim Ts)
+    std::shared_mutex       _dyn_cache_mutex;
+
+    // Background reconcile thread
+    std::thread       _reconcile_thread;
+    std::atomic<bool> _stop_reconcile{false};
 
 
     // filter support
