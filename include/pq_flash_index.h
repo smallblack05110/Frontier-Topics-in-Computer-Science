@@ -178,8 +178,8 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     uint64_t _disk_bytes_per_point = 0; // Number of bytes
 
     std::string _disk_index_file;
-    // weighted visit score: score += 1/(1+hop), so late-hop nodes score higher
-    std::vector<std::pair<uint32_t, float>> _node_visit_counter;
+    // weighted visit score: score += 1024/(1+hop) scaled integer, so late-hop nodes score higher
+    std::vector<std::pair<uint32_t, uint32_t>> _node_visit_counter;
 
     // PQ data
     // _n_chunks = # of chunks ndims is split into
@@ -243,7 +243,8 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     tsl::robin_map<uint32_t, T *>                              _dyn_coord_cache;
     std::vector<uint32_t *> _dyn_nhood_bufs; // owns raw buffers (each _max_degree+1 u32s)
     std::vector<T *>        _dyn_coord_bufs; // owns raw coord buffers (each _aligned_dim Ts)
-    std::shared_mutex       _dyn_cache_mutex;
+    std::shared_mutex        _dyn_cache_mutex;
+    std::atomic<uint32_t>    _dyn_cache_size{0}; // live size, read without lock
 
     // Background reconcile thread
     std::thread       _reconcile_thread;

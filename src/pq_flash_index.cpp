@@ -359,8 +359,9 @@ void PQFlashIndex<T, LabelT>::_reconcile_dynamic_cache()
             _dyn_coord_cache.insert({candidates[i], coord_buffers[i]});
         }
     }
+    _dyn_cache_size.store((uint32_t)_dyn_nhood_cache.size(), std::memory_order_release);
     diskann::cout << "[DynCache] reconciled: " << _dyn_nhood_cache.size() << " nodes." << std::endl;
-    _cms.reset(); // reset sketch for next window
+    _cms.reset();
 }
 
 #ifdef EXEC_ENV_OLS
@@ -395,7 +396,7 @@ void PQFlashIndex<T, LabelT>::generate_cache_list_from_sample_queries(std::strin
     for (uint32_t i = 0; i < _node_visit_counter.size(); i++)
     {
         this->_node_visit_counter[i].first = i;
-        this->_node_visit_counter[i].second = 0.0f;
+        this->_node_visit_counter[i].second = 0;
     }
 
     uint64_t sample_num, sample_dim, sample_aligned_dim;
@@ -441,7 +442,7 @@ void PQFlashIndex<T, LabelT>::generate_cache_list_from_sample_queries(std::strin
     }
 
     std::sort(this->_node_visit_counter.begin(), _node_visit_counter.end(),
-              [](const std::pair<uint32_t, float> &left, const std::pair<uint32_t, float> &right) {
+              [](const std::pair<uint32_t, uint32_t> &left, const std::pair<uint32_t, uint32_t> &right) {
                   return left.second > right.second;
               });
     node_list.clear();
@@ -449,88 +450,8 @@ void PQFlashIndex<T, LabelT>::generate_cache_list_from_sample_queries(std::strin
     num_nodes_to_cache = std::min(num_nodes_to_cache, this->_node_visit_counter.size());
     node_list.reserve(num_nodes_to_cache);
 
-    // Gorgeous-aware deduplication:
-    // If a candidate node is already embedded as a top-k neighbor inside
-    // a sector of a node that IS being cached, gorgeous will serve it for
-    // free. Skip those slots and give them to uncovered nodes instead.
-    if (_gorgeous_k_copy > 0)
-    {
-        // First pass: collect nodes that will definitely be cached (uncovered)
-        tsl::robin_set<uint32_t> will_cache;
-        tsl::robin_set<uint32_t> gorgeous_covered;
-
-        // We need the adjacency list of each chosen node to know its gorgeous neighbors.
-        // Load them in bulk using read_nodes.
-        // Strategy: two-pass.
-        //   Pass 1: select greedily, marking gorgeous-covered nodes.
-        //   We approximate by iterating the sorted list; for each selected node,
-        //   mark its top _gorgeous_k_copy neighbors as covered.
-        //   We need nhoods -- read them on the fly in blocks of 64.
-        const size_t BLOCK = 64;
-        size_t cand_idx = 0;
-        size_t total_cands = _node_visit_counter.size();
-
-        while (node_list.size() < num_nodes_to_cache && cand_idx < total_cands)
-        {
-            // Build a block of candidates not yet covered
-            std::vector<uint32_t> block_ids;
-            block_ids.reserve(BLOCK);
-            size_t scan = cand_idx;
-            while (block_ids.size() < BLOCK && scan < total_cands)
-            {
-                uint32_t id = _node_visit_counter[scan].first;
-                if (!gorgeous_covered.count(id))
-                    block_ids.push_back(id);
-                scan++;
-            }
-            cand_idx = scan;
-            if (block_ids.empty()) break;
-
-            // Read nhoods for block
-            std::vector<T *> dummy_coords(block_ids.size(), nullptr);
-            std::vector<uint32_t> nhood_store(block_ids.size() * (_max_degree + 1), 0u);
-            std::vector<std::pair<uint32_t, uint32_t *>> nbr_bufs;
-            nbr_bufs.reserve(block_ids.size());
-            for (size_t bi = 0; bi < block_ids.size(); bi++)
-                nbr_bufs.emplace_back(0u, nhood_store.data() + bi * (_max_degree + 1));
-            auto ok = read_nodes(block_ids, dummy_coords, nbr_bufs);
-
-            for (size_t bi = 0; bi < block_ids.size(); bi++)
-            {
-                if (node_list.size() >= num_nodes_to_cache) break;
-                uint32_t id = block_ids[bi];
-                if (gorgeous_covered.count(id)) continue;
-                node_list.push_back(id);
-                will_cache.insert(id);
-                // Mark this node's top k_copy neighbors as covered by gorgeous
-                if (ok[bi])
-                {
-                    uint32_t *nh = nbr_bufs[bi].second;
-                    uint32_t nn = std::min(nh[0], (uint32_t)_gorgeous_k_copy);
-                    for (uint32_t ni = 0; ni < nn; ni++)
-                        gorgeous_covered.insert(nh[1 + ni]);
-                }
-            }
-        }
-
-        // Fill remainder without gorgeous check if we didn't reach quota
-        if (node_list.size() < num_nodes_to_cache)
-        {
-            for (size_t i = 0; i < total_cands && node_list.size() < num_nodes_to_cache; i++)
-            {
-                uint32_t id = _node_visit_counter[i].first;
-                if (!will_cache.count(id))
-                    node_list.push_back(id);
-            }
-        }
-        diskann::cout << "Gorgeous-aware dedup: selected " << node_list.size()
-                      << " nodes (covered " << gorgeous_covered.size() << " by gorgeous)." << std::endl;
-    }
-    else
-    {
-        for (uint64_t i = 0; i < num_nodes_to_cache; i++)
-            node_list.push_back(this->_node_visit_counter[i].first);
-    }
+    for (uint64_t i = 0; i < num_nodes_to_cache; i++)
+        node_list.push_back(this->_node_visit_counter[i].first);
 
     this->_count_visited_nodes = false;
 
@@ -1674,9 +1595,9 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             }
             else
             {
-                // Check dynamic LFU cache (shared_lock: concurrent reads OK)
+                // Check dynamic LFU cache — skip lock entirely when cache is empty
                 bool dyn_hit = false;
-                if (_dyn_cache_cap > 0)
+                if (_dyn_cache_size.load(std::memory_order_relaxed) > 0)
                 {
                     std::shared_lock<std::shared_mutex> lk(_dyn_cache_mutex);
                     auto dit = _dyn_nhood_cache.find(nbr.id);
@@ -1703,7 +1624,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 }
             }
 
-            // Update CMS for dynamic cache promotion (always, cheap atomic)
+            // Update CMS only after static cache is loaded (cap > 0)
+            // This feeds the reconcile thread; zero overhead before load_cache_list
             if (_dyn_cache_cap > 0)
                 _cms.add(nbr.id);
 
